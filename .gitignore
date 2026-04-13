@@ -1,0 +1,8 @@
+hf-cache/
+models/
+test-data/
+logs/
+*.log
+*.pyc
+__pycache__/
+.env

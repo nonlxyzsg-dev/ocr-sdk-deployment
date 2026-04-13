@@ -1,0 +1,80 @@
+services:
+  ocr-sdk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # IP-хак для Fastly CDN — PyPI и files.pythonhosted.org недоступны
+      # по DNS из-за корпоративного блокирования. Действует только на build.
+      extra_hosts:
+        - "pypi.org:151.101.192.223"
+        - "files.pythonhosted.org:151.101.192.223"
+    image: ocr-sdk:latest
+    container_name: ocr-sdk
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+
+    ports:
+      - "10.121.3.201:9996:5002"
+
+    volumes:
+      # Минимальный config.yaml с единственным параметром model_dir (ro)
+      - ./config.yaml:/app/config.yaml:ro
+      # Оффлайн-модель PP-DocLayoutV3 (ro — гарантия что ничего не пишется)
+      - ./hf-cache:/hf-cache:ro
+      # Каталог для логов на будущее (rw)
+      - ./logs:/app/logs
+      # Тестовые файлы для smoke-тестов
+      - ./test-data:/test-data:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+
+    environment:
+      # === Режим работы SDK ===
+      # selfhosted → pipeline.maas.enabled=false (без этого SDK идёт в Zhipu cloud!)
+      GLMOCR_MODE: selfhosted
+      # Включение layout cropping — главная фишка GLM-OCR.
+      # Без этого страницы шлются целиком без нарезки по регионам.
+      GLMOCR_ENABLE_LAYOUT: "true"
+
+      # === Подключение к vLLM из Уровня 1 ===
+      GLMOCR_OCR_API_HOST: 10.121.3.201
+      GLMOCR_OCR_API_PORT: "9997"
+      GLMOCR_OCR_API_KEY: cant-be-empty
+      GLMOCR_OCR_MODEL: Qwen3.5-2B
+
+      # === Layout на CPU ===
+      # Явный CPU — гарантия что ни 1 ГБ VRAM A100 не съедается layout-моделью,
+      # даже если torch увидит CUDA через default-runtime: nvidia в daemon.json.
+      GLMOCR_LAYOUT_DEVICE: cuda:0
+
+      # === Логирование ===
+      GLMOCR_LOG_LEVEL: INFO
+
+      # === Offline-режим для HuggingFace ===
+      # Физический запрет transformers идти в сеть за моделью.
+      # Модель уже локально в /hf-cache/PP-DocLayoutV3_safetensors,
+      # путь указан в config.yaml как pipeline.layout.model_dir.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+
+    healthcheck:
+      # python вместо curl — в python:3.12-slim нет curl, не хочется ставить.
+      # urlopen бросит HTTPError при не-200, exit code станет ненулевым.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5002/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # 120 сек — запас на импорт torch/transformers + загрузку 128 МБ safetensors
+      start_period: 120s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
